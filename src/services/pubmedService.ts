@@ -48,7 +48,15 @@ export function isHealthClaim(claimText: string): boolean {
     'blood pressure', 'cholesterol', 'blood sugar', 'metabolism',
     
     // Research terms
-    'study', 'research', 'clinical trial', 'patients', 'symptoms',
+    'study', 'studies', 'research', 'clinical trial', 'trial', 'trials',
+    'experiment', 'experiments', 'survey', 'analysis', 'meta-analysis',
+    'findings', 'evidence', 'data', 'statistics', 'statistically',
+    'peer-reviewed', 'journal', 'publication', 'published', 'paper',
+    'concluded', 'found that', 'shows that', 'suggests that', 'proves',
+    'according to', 'scientists say', 'researchers found', 'experts',
+    'university', 'institute', 'laboratory', 'lab',
+    'sample', 'participants', 'subjects', 'patients', 'symptoms',
+    'percent', 'percentage', 'randomized', 'controlled', 'double-blind', 'placebo',
     'risk', 'cause', 'prevent', 'reduce', 'increase', 'improve',
     
     // Medical professionals
