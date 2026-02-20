@@ -1,11 +1,21 @@
 /**
  * Verification Service - Aggregates results from multiple fact-checking sources
+ * 
+ * Verification flow:
+ * 1. Check cache
+ * 2. Google Fact Check API (authoritative fact-checkers)
+ * 3. PubMed for health claims (scientific literature)
+ * 4. Wikipedia (reference information, supplementary)
+ * 5. OpenAI LLM fallback
+ * 6. Return unverified if nothing found
  */
 
 import NodeCache from 'node-cache';
-import { Claim, Verification, Rating } from '../types';
+import { Claim, Verification, Rating, Evidence } from '../types';
 import { searchFactChecks } from './googleFactCheck';
 import { verifyClaimWithLLM } from './llmService';
+import { verifyWithWikipedia } from './wikipediaService';
+import { verifyWithPubMed, isHealthClaim } from './pubmedService';
 
 // In-memory cache for verification results
 const cache = new NodeCache({
@@ -44,6 +54,65 @@ function createUnverifiedResult(claim: Claim): Verification {
 }
 
 /**
+ * Merge evidence from multiple sources, avoiding duplicates
+ */
+function mergeEvidence(primary: Evidence[], secondary: Evidence[]): Evidence[] {
+  const seen = new Set(primary.map(e => e.url));
+  const unique = secondary.filter(e => e.url && !seen.has(e.url));
+  return [...primary, ...unique].slice(0, 10); // Limit to 10 pieces of evidence
+}
+
+/**
+ * Combine verifications from multiple sources
+ */
+function combineVerifications(
+  claim: Claim,
+  results: Array<Verification | null>
+): Verification {
+  const validResults = results.filter((r): r is Verification => r !== null);
+  
+  if (validResults.length === 0) {
+    return createUnverifiedResult(claim);
+  }
+  
+  // Sort by confidence (highest first)
+  validResults.sort((a, b) => b.confidence - a.confidence);
+  
+  // Use the highest confidence result as primary
+  const primary = validResults[0];
+  
+  // Merge evidence from all sources
+  let allEvidence = primary.evidence;
+  for (const result of validResults.slice(1)) {
+    allEvidence = mergeEvidence(allEvidence, result.evidence);
+  }
+  
+  // Combine caveats
+  const allCaveats = new Set<string>();
+  for (const result of validResults) {
+    if (result.caveats) {
+      result.caveats.forEach(c => allCaveats.add(c));
+    }
+  }
+  
+  // Build combined summary
+  let summary = primary.summary;
+  if (validResults.length > 1) {
+    summary += ` (Verified against ${validResults.length} sources)`;
+  }
+  
+  return {
+    claimId: claim.id,
+    rating: primary.rating,
+    confidence: primary.confidence,
+    summary,
+    evidence: allEvidence,
+    checkedAt: new Date().toISOString(),
+    caveats: Array.from(allCaveats).slice(0, 5),
+  };
+}
+
+/**
  * Verify a single claim using all available sources
  */
 export async function verifyClaim(claim: Claim): Promise<{ verification: Verification; cached: boolean }> {
@@ -53,7 +122,6 @@ export async function verifyClaim(claim: Claim): Promise<{ verification: Verific
   const cached = cache.get<Verification>(cacheKey);
   if (cached) {
     console.log(`[VerificationService] Cache hit for: "${claim.text.substring(0, 50)}..."`);
-    // Update the claimId to match the current request
     return { 
       verification: { ...cached, claimId: claim.id }, 
       cached: true 
@@ -62,29 +130,71 @@ export async function verifyClaim(claim: Claim): Promise<{ verification: Verific
   
   console.log(`[VerificationService] Verifying: "${claim.text.substring(0, 50)}..."`);
   
-  // Try Google Fact Check API first
   const googleApiKey = process.env.GOOGLE_FACT_CHECK_API_KEY;
-  let verification: Verification | null = null;
+  const openaiApiKey = process.env.OPENAI_API_KEY;
+  const pubmedApiKey = process.env.PUBMED_API_KEY; // Optional
   
+  const results: Array<Verification | null> = [];
+  
+  // 1. Try Google Fact Check API first (most authoritative)
   if (googleApiKey && googleApiKey !== 'your_google_api_key_here') {
-    verification = await searchFactChecks(claim, googleApiKey);
-  }
-  
-  // If no fact-checks found, try LLM-based verification as fallback
-  if (!verification) {
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (openaiApiKey && openaiApiKey !== 'your_openai_api_key_here') {
-      console.log(`[VerificationService] No fact-checks found, trying LLM verification...`);
-      verification = await verifyClaimWithLLM(claim, openaiApiKey);
+    const googleResult = await searchFactChecks(claim, googleApiKey);
+    if (googleResult && googleResult.rating !== 'unverified') {
+      // High confidence result from fact-checkers - use it
+      console.log(`[VerificationService] Found definitive fact-check from Google`);
+      results.push(googleResult);
     }
   }
   
-  // If still no results, return unverified
-  if (!verification) {
-    verification = createUnverifiedResult(claim);
+  // 2. For health claims, check PubMed
+  if (isHealthClaim(claim.text)) {
+    try {
+      const pubmedResult = await verifyWithPubMed(claim, pubmedApiKey);
+      if (pubmedResult) {
+        console.log(`[VerificationService] Found relevant PubMed research`);
+        results.push(pubmedResult);
+      }
+    } catch (error) {
+      console.error('[VerificationService] PubMed error:', error);
+    }
   }
   
-  // Cache the result (using normalized key so similar claims share cache)
+  // 3. Try Wikipedia for supplementary information
+  try {
+    const wikiResult = await verifyWithWikipedia(claim);
+    if (wikiResult && wikiResult.evidence.length > 0) {
+      console.log(`[VerificationService] Found Wikipedia reference`);
+      // Only add if we have no other results or to supplement
+      if (results.length === 0) {
+        results.push(wikiResult);
+      } else {
+        // Add Wikipedia evidence to existing results
+        results.push(wikiResult);
+      }
+    }
+  } catch (error) {
+    console.error('[VerificationService] Wikipedia error:', error);
+  }
+  
+  // 4. If no results, try LLM as last resort
+  if (results.length === 0 || results.every(r => r?.rating === 'unverified')) {
+    if (openaiApiKey && openaiApiKey !== 'your_openai_api_key_here') {
+      console.log(`[VerificationService] No fact-checks found, trying LLM verification...`);
+      try {
+        const llmResult = await verifyClaimWithLLM(claim, openaiApiKey);
+        if (llmResult) {
+          results.push(llmResult);
+        }
+      } catch (error) {
+        console.error('[VerificationService] LLM error:', error);
+      }
+    }
+  }
+  
+  // Combine all results
+  const verification = combineVerifications(claim, results);
+  
+  // Cache the result
   cache.set(cacheKey, verification);
   
   return { verification, cached: false };
